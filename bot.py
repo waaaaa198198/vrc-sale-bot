@@ -18,43 +18,38 @@ client = discord.Client(intents=intents)
 SEEN_FILE = "seen.json"
 
 try:
-    with open(SEEN_FILE,"r") as f:
+    with open(SEEN_FILE, "r") as f:
         seen = set(json.load(f))
 except:
     seen = set()
 
 def save_seen():
-    with open(SEEN_FILE,"w") as f:
-        json.dump(list(seen),f)
+    with open(SEEN_FILE, "w") as f:
+        json.dump(list(seen), f)
 
 def get_today_url():
     today = datetime.now().strftime("%Y-%m-%d")
     return f"https://vrc-sale.com/sales/{today}"
 
 async def check_sales():
-
     await client.wait_until_ready()
 
     while True:
-
         url = get_today_url()
 
         try:
-headers = {
-    "User-Agent": "Mozilla/5.0"
-}
-
-r = requests.get(url, headers=headers, timeout=10)
+            headers = {
+                "User-Agent": "Mozilla/5.0"
+            }
+            r = requests.get(url, headers=headers, timeout=10)
         except:
             await asyncio.sleep(300)
             continue
 
-        soup = BeautifulSoup(r.text,"html.parser")
-
+        soup = BeautifulSoup(r.text, "html.parser")
         cards = soup.select("article")
 
         for card in cards:
-
             title_tag = card.select_one("h3")
 
             if not title_tag:
@@ -66,7 +61,6 @@ r = requests.get(url, headers=headers, timeout=10)
                 continue
 
             text = card.text
-
             price = None
 
             if "無料" in text:
@@ -111,12 +105,10 @@ r = requests.get(url, headers=headers, timeout=10)
             embed.set_footer(text="VRC Sale Monitor")
 
             if price == 0:
-
                 ch = client.get_channel(CHANNEL_FREE)
                 await ch.send(embed=embed)
 
             elif price <= 1000:
-
                 ch = client.get_channel(CHANNEL_CHEAP)
                 await ch.send(embed=embed)
 
