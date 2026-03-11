@@ -8,8 +8,8 @@ from datetime import datetime
 
 TOKEN = "YOUR_TOKEN"
 
-CHANNEL_FREE = 111111111111
-CHANNEL_CHEAP = 222222222222
+CHANNEL_FREE = 1481284062789374013
+CHANNEL_CHEAP = 1481283710660907242
 
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
