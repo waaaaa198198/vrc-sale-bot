@@ -1,122 +1,53 @@
 import discord
-import requests
-from bs4 import BeautifulSoup
 import asyncio
-import re
-import json
 import os
-from datetime import datetime
+import feedparser
 
 TOKEN = os.getenv("TOKEN")
 
 CHANNEL_FREE = 1481284062789374013
 CHANNEL_CHEAP = 1481283710660907242
 
+RSS_URL = "https://vrc-sale.com/feed"
+
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 
-SEEN_FILE = "seen.json"
+seen = set()
 
-try:
-    with open(SEEN_FILE, "r") as f:
-        seen = set(json.load(f))
-except:
-    seen = set()
-
-def save_seen():
-    with open(SEEN_FILE, "w") as f:
-        json.dump(list(seen), f)
-
-def get_today_url():
-    today = datetime.now().strftime("%Y-%m-%d")
-    return f"https://vrc-sale.com/sales/{today}"
-
-async def check_sales():
+async def check_rss():
     await client.wait_until_ready()
 
     while True:
-        url = get_today_url()
+        feed = feedparser.parse(RSS_URL)
 
-        try:
-            headers = {
-                "User-Agent": "Mozilla/5.0"
-            }
-            r = requests.get(url, headers=headers, timeout=10)
-        except:
-            await asyncio.sleep(300)
-            continue
+        for entry in feed.entries:
+            title = entry.title
+            link = entry.link
 
-        soup = BeautifulSoup(r.text, "html.parser")
-        cards = soup.select("article")
-
-        for card in cards:
-            title_tag = card.select_one("h3")
-
-            if not title_tag:
+            if title in seen:
                 continue
 
-            name = title_tag.text.strip()
+            seen.add(title)
 
-            if name in seen:
-                continue
+            if "無料" in title:
+                ch = client.get_channel(CHANNEL_FREE)
+                await ch.send(f"🆓 無料アイテム\n{title}\n{link}")
 
-            text = card.text
-            price = None
-
-            if "無料" in text:
-                price = 0
             else:
-                m = re.search(r"￥(\d+)", text)
+                import re
+                m = re.search(r"(\d+)円", title)
                 if m:
                     price = int(m.group(1))
-
-            if price is None:
-                continue
-
-            link_tag = card.select_one("a")
-            booth_url = link_tag["href"] if link_tag else None
-
-            img_tag = card.select_one("img")
-            image = img_tag["src"] if img_tag else None
-
-            seen.add(name)
-            save_seen()
-
-            embed = discord.Embed(
-                title=name,
-                url=booth_url,
-                color=0x00ffcc
-            )
-
-            if price == 0:
-                embed.description = "🆓 **無料アイテム**"
-            else:
-                embed.description = f"💰 **{price}円セール**"
-
-            embed.add_field(
-                name="セールページ",
-                value=url,
-                inline=False
-            )
-
-            if image:
-                embed.set_thumbnail(url=image)
-
-            embed.set_footer(text="VRC Sale Monitor")
-
-            if price == 0:
-                ch = client.get_channel(CHANNEL_FREE)
-                await ch.send(embed=embed)
-
-            elif price <= 1000:
-                ch = client.get_channel(CHANNEL_CHEAP)
-                await ch.send(embed=embed)
+                    if price <= 1000:
+                        ch = client.get_channel(CHANNEL_CHEAP)
+                        await ch.send(f"💰 {price}円セール\n{title}\n{link}")
 
         await asyncio.sleep(300)
 
 @client.event
 async def on_ready():
     print("BOT起動")
-    client.loop.create_task(check_sales())
+    client.loop.create_task(check_rss())
 
 client.run(TOKEN)
