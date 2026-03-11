@@ -10,6 +10,7 @@ from urllib.parse import quote
 TOKEN = os.getenv("TOKEN")
 
 CHANNEL_FREE = 1481284062789374013
+CHANNEL_CHEAP = 1481283710660907242
 
 SEEN_FILE = "seen.json"
 
@@ -83,26 +84,22 @@ def looks_model_related(text: str) -> bool:
     lower = text.lower()
     return any(word.lower() in lower for word in MODEL_POSITIVE_WORDS)
 
-def get_product_page_image(url: str) -> str | None:
+def get_product_page_image(url: str):
     try:
         r = session.get(url, timeout=20)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
 
-        og_image = soup.select_one('meta[property="og:image"]')
-        if og_image and og_image.get("content"):
-            return normalize_url(og_image["content"])
+        og = soup.select_one('meta[property="og:image"]')
+        if og and og.get("content"):
+            return normalize_url(og["content"])
 
-        twitter_image = soup.select_one('meta[name="twitter:image"]')
-        if twitter_image and twitter_image.get("content"):
-            return normalize_url(twitter_image["content"])
-
-        img = soup.select_one("img")
-        if img and img.get("src"):
-            return normalize_url(img["src"])
+        tw = soup.select_one('meta[name="twitter:image"]')
+        if tw and tw.get("content"):
+            return normalize_url(tw["content"])
 
     except Exception as e:
-        print(f"image fetch error: {url} / {e}")
+        print(f"image fetch error: {e}")
 
     return None
 
@@ -127,7 +124,6 @@ def extract_items(html: str):
             "title": title,
             "url": href,
             "price": price,
-            "image": None,
             "text": combined
         })
 
@@ -137,21 +133,38 @@ def extract_items(html: str):
     return list(dedup.values())
 
 async def send_item(item):
-    embed = discord.Embed(
-        title=item["title"][:256],
-        url=item["url"],
-        description="🆓 無料アイテム",
-        color=0x00CC99
-    )
+    price = item["price"]
+    url = item["url"]
 
-    embed.add_field(name="BOOTH", value=item["url"], inline=False)
+    image = get_product_page_image(url)
 
-    if item["image"]:
-        embed.set_image(url=item["image"])
+    if price == 0:
+        embed = discord.Embed(
+            title=item["title"][:256],
+            url=url,
+            description="🆓 無料アイテム",
+            color=0x00CC99
+        )
+    else:
+        embed = discord.Embed(
+            title=item["title"][:256],
+            url=url,
+            description=f"💰 {price}円",
+            color=0x3399FF
+        )
 
-    embed.set_footer(text="BOOTH free model monitor")
+    embed.add_field(name="BOOTH", value=url, inline=False)
 
-    ch = client.get_channel(CHANNEL_FREE)
+    if image:
+        embed.set_image(url=image)
+
+    embed.set_footer(text="BOOTH model monitor")
+
+    if price == 0:
+        ch = client.get_channel(CHANNEL_FREE)
+    else:
+        ch = client.get_channel(CHANNEL_CHEAP)
+
     if ch:
         await ch.send(embed=embed)
 
@@ -179,17 +192,18 @@ async def check_booth():
 
                 if not url or url in seen:
                     continue
-                if price != 0:
+                if price is None:
+                    continue
+                if price > 1000:
                     continue
                 if should_exclude(text):
                     continue
                 if not looks_model_related(text):
                     continue
 
-                item["image"] = get_product_page_image(url)
-
                 seen.add(url)
                 save_seen()
+
                 await send_item(item)
 
         except Exception as e:
@@ -203,7 +217,7 @@ async def on_ready():
 
     ch = client.get_channel(CHANNEL_FREE)
     if ch:
-        await ch.send("✅ 無料モデル監視BOTが起動しました")
+        await ch.send("✅ 無料 & 1000円以下モデル監視BOTが起動しました")
 
     client.loop.create_task(check_booth())
 
