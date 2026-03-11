@@ -4,9 +4,10 @@ from bs4 import BeautifulSoup
 import asyncio
 import re
 import json
+import os
 from datetime import datetime
 
-TOKEN = "YOUR_TOKEN"
+TOKEN = os.getenv("TOKEN")
 
 CHANNEL_FREE = 1481284062789374013
 CHANNEL_CHEAP = 1481283710660907242
