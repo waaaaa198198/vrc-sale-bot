@@ -40,7 +40,11 @@ async def check_sales():
         url = get_today_url()
 
         try:
-            r = requests.get(url,timeout=10)
+headers = {
+    "User-Agent": "Mozilla/5.0"
+}
+
+r = requests.get(url, headers=headers, timeout=10)
         except:
             await asyncio.sleep(300)
             continue
