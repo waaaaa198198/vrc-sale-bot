@@ -22,7 +22,7 @@ if not DISCORD_TOKEN:
 # Discord Channels
 # =========================
 CHANNEL_FREE = 1481284062789374013
-CHANNEL_CHEAP = 1481283710660907242
+CHANNEL_B = 1481283710660907242
 
 # =========================
 # Files
@@ -37,10 +37,10 @@ JST = timezone(timedelta(hours=9))
 # =========================
 # Monitoring Settings
 # =========================
-CHECK_INTERVAL = 60 * 60              # 1時間ごと
-REMINDER_AFTER = 22 * 60 * 60         # 22時間後
-REMINDER_DELETE_AFTER = 2 * 60 * 60   # 2時間後に自動削除
-REMINDER_POLL_INTERVAL = 60           # 1分ごとにリマインド確認
+CHECK_INTERVAL = 60 * 60
+REMINDER_AFTER = 22 * 60 * 60
+REMINDER_DELETE_AFTER = 2 * 60 * 60
+REMINDER_POLL_INTERVAL = 60
 
 # =========================
 # BOOTH Search
@@ -67,12 +67,12 @@ NEGATIVE_WORDS = [
 
     # 音声・本系
     "配信", "同人誌", "漫画", "小説", "音声", "bgm", "効果音",
+    "mp3", "wav",
 
-    # モーション系は完全除外
+    # モーション系は除外（ポーズは除外しない）
     "モーション", "motion", "animation", "アニメーション",
-    "animator", "gesture", "fx", "ダンス", "振り付け", "ポーズ",
+    "animator", "gesture", "fx", "ダンス", "振り付け",
 
-    # その他対象外になりやすいもの
     "live2d", "aviutl", "after effects", "動画素材",
 ]
 
@@ -83,13 +83,18 @@ CATEGORY_KEYWORDS = {
     ],
     "髪型": [
         "髪", "ヘア", "hair", "hairstyle", "前髪", "後ろ髪", "ツインテ",
-        "ポニテ", "ショートヘア", "ロングヘア"
+        "ポニテ", "ポニーテール", "ショートヘア", "ロングヘア"
     ],
     "アクセサリー": [
         "アクセサリー", "accessory", "アクセ", "装飾", "小物",
         "帽子", "帽", "眼鏡", "メガネ", "ピアス", "イヤリング",
         "ネックレス", "指輪", "リング", "尻尾", "しっぽ", "角", "羽",
-        "チョーカー", "ブレスレット", "腕輪", "イヤーカフ", "カチューシャ"
+        "チョーカー", "ブレスレット", "腕輪", "イヤーカフ", "カチューシャ",
+        "バンスクリップ", "ヘアクリップ"
+    ],
+    "ポーズ": [
+        "ポーズ", "pose", "撮影ポーズ", "立ちポーズ",
+        "座りポーズ", "ポージング"
     ],
 }
 
@@ -116,6 +121,18 @@ LIMITED_FREE_PATTERNS = [
     r"先着\d+名限定",
 ]
 
+SALE_HINT_PATTERNS = [
+    r"セール",
+    r"sale",
+    r"割引",
+    r"値引",
+    r"off",
+    r"discount",
+    r"期間限定価格",
+    r"発売記念",
+    r"記念価格",
+]
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0"
 }
@@ -123,28 +140,59 @@ HEADERS = {
 intents = discord.Intents.default()
 
 
+# =========================
+# State Helpers
+# =========================
+def extract_item_id(url: str) -> Optional[str]:
+    if not url:
+        return None
+    m = re.search(r"/items/(\d+)", url)
+    if m:
+        return m.group(1)
+    return None
+
+
+def canonical_item_key(url: str) -> str:
+    item_id = extract_item_id(url)
+    if item_id:
+        return f"booth-item:{item_id}"
+    return normalize_url(url)
+
+
 def load_state():
     default_state = {
-        "seen_urls": [],
+        "seen_keys": [],
+        "seen_urls": [],        # 旧互換
         "reminders": [],
         "reminded_keys": [],
+        "initialized_once": False,
     }
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            for k, v in default_state.items():
-                if k not in data:
-                    data[k] = v
-            return data
     except Exception:
-        return default_state
+        data = default_state.copy()
+
+    for k, v in default_state.items():
+        if k not in data:
+            data[k] = v
+
+    # 旧 seen_urls から seen_keys へ移行
+    seen_keys = set(data.get("seen_keys", []))
+    for url in data.get("seen_urls", []):
+        seen_keys.add(canonical_item_key(url))
+    data["seen_keys"] = list(seen_keys)
+
+    return data
 
 
 def save_state(state):
     tmp = {
-        "seen_urls": sorted(list(set(state.get("seen_urls", [])))),
+        "seen_keys": sorted(list(set(state.get("seen_keys", [])))),
+        "seen_urls": [],  # 新コードでは使わない
         "reminders": state.get("reminders", []),
         "reminded_keys": sorted(list(set(state.get("reminded_keys", [])))),
+        "initialized_once": state.get("initialized_once", False),
     }
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(tmp, f, ensure_ascii=False, indent=2)
@@ -164,6 +212,9 @@ def build_vrc_sale_url(date_str: Optional[str] = None) -> str:
     return f"{VRC_SALE_BASE}/{date_str}"
 
 
+# =========================
+# General Helpers
+# =========================
 def build_search_url(keyword: str) -> str:
     encoded = quote(keyword)
     return f"https://booth.pm/ja/search/{encoded}?sort=new"
@@ -202,6 +253,39 @@ def parse_price(text: str) -> Optional[int]:
     return None
 
 
+def parse_discount_percent(text: str) -> int:
+    if not text:
+        return 0
+
+    patterns = [
+        r"([0-9]{1,3})\s*%",
+        r"([0-9]{1,3})\s*％",
+        r"([0-9]{1,3})\s*percent",
+        r"([0-9]{1,3})\s*off",
+        r"([0-9]{1,3})\s*OFF",
+        r"([0-9]{1,3})\s*割引",
+        r"([0-9]{1,3})\s*引き",
+    ]
+
+    best = 0
+    for pattern in patterns:
+        for m in re.finditer(pattern, text, re.IGNORECASE):
+            try:
+                value = int(m.group(1))
+                if 0 < value <= 100:
+                    best = max(best, value)
+            except Exception:
+                pass
+    return best
+
+
+def looks_sale_text(text: str) -> bool:
+    for pattern in SALE_HINT_PATTERNS:
+        if re.search(pattern, text, re.IGNORECASE):
+            return True
+    return False
+
+
 def should_exclude(text: str) -> bool:
     lower = text.lower()
     return any(word.lower() in lower for word in NEGATIVE_WORDS)
@@ -219,12 +303,11 @@ def detect_categories(text: str) -> list[str]:
 def looks_target_item(text: str, categories: list[str]) -> bool:
     lower = text.lower()
 
-    if not categories:
-        return False
-
+    # 共通3D/VRChat文脈があればOK
     if any(word.lower() in lower for word in COMMON_POSITIVE_WORDS):
         return True
 
+    # 未分類も拾う
     return True
 
 
@@ -236,9 +319,12 @@ def looks_limited_free(text: str) -> bool:
 
 
 def reminder_key(url: str) -> str:
-    return f"reminder::{normalize_booth_url(url)}"
+    return f"reminder::{canonical_item_key(url)}"
 
 
+# =========================
+# HTTP Helpers
+# =========================
 async def fetch_text(session: aiohttp.ClientSession, url: str, headers: dict | None = None) -> Optional[str]:
     try:
         async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=25)) as resp:
@@ -249,6 +335,9 @@ async def fetch_text(session: aiohttp.ClientSession, url: str, headers: dict | N
         return None
 
 
+# =========================
+# BOOTH Parsing
+# =========================
 def extract_items_from_search_html(html: str):
     soup = BeautifulSoup(html, "html.parser")
     items = []
@@ -268,18 +357,20 @@ def extract_items_from_search_html(html: str):
         price = parse_price(combined)
 
         items.append({
+            "key": canonical_item_key(href),
             "title": title[:256],
             "url": href,
             "price": price,
             "text": combined,
             "source": "booth_search",
             "source_detail": "",
+            "discount_percent": parse_discount_percent(combined),
+            "is_sale_hint": looks_sale_text(combined),
         })
 
     dedup = {}
     for item in items:
-        if item["url"] not in dedup:
-            dedup[item["url"]] = item
+        dedup[item["key"]] = item
     return list(dedup.values())
 
 
@@ -291,6 +382,8 @@ async def get_product_page_info(session: aiohttp.ClientSession, url: str) -> dic
             "image": None,
             "text": "",
             "price": None,
+            "discount_percent": 0,
+            "is_sale_hint": False,
         }
 
     try:
@@ -314,12 +407,16 @@ async def get_product_page_info(session: aiohttp.ClientSession, url: str) -> dic
         body_text = re.sub(r"\s+", " ", body_text).strip()
 
         price = parse_price(body_text)
+        discount_percent = parse_discount_percent(body_text)
+        is_sale_hint = looks_sale_text(body_text)
 
         return {
             "title": title[:256] if title else None,
             "image": image,
             "text": body_text,
             "price": price,
+            "discount_percent": discount_percent,
+            "is_sale_hint": is_sale_hint,
         }
     except Exception as e:
         print(f"get_product_page_info parse error {url}: {e}")
@@ -328,69 +425,94 @@ async def get_product_page_info(session: aiohttp.ClientSession, url: str) -> dic
             "image": None,
             "text": "",
             "price": None,
+            "discount_percent": 0,
+            "is_sale_hint": False,
         }
 
 
+# =========================
+# vrc-sale Parsing
+# =========================
 def extract_items_from_vrc_sale_html(html: str, page_url: str) -> list[dict]:
     soup = BeautifulSoup(html, "html.parser")
     items = []
+    dedup = {}
 
-    booth_links = soup.select('a[href*="booth.pm"]')
-
-    for a in booth_links:
-        href = normalize_url(a.get("href", ""))
+    for a in soup.select('a[href*="booth.pm/items/"]'):
+        href = normalize_booth_url(a.get("href", ""))
         if not href:
             continue
 
-        parent = a.parent
+        key = canonical_item_key(href)
+
         block_text = ""
-        title = ""
-        category_text = ""
-
-        node = parent
-        for _ in range(4):
-            if node:
-                block_text = node.get_text(" ", strip=True)
-                node = node.parent
-
-        h3 = None
-        node = a.parent
+        node = a
         for _ in range(6):
             if not node:
                 break
-            h3 = node.find(["h3", "h2"])
-            if h3:
+            block_text = node.get_text(" ", strip=True)
+            if block_text and len(block_text) >= 20:
                 break
             node = node.parent
 
-        if h3:
-            title = re.sub(r"\s+", " ", h3.get_text(" ", strip=True)).strip()
+        # 周辺テキストを多めに拾う
+        if a.parent:
+            parent_text = a.parent.get_text(" ", strip=True)
+            block_text = f"{block_text} {parent_text}".strip()
 
-        cat_match = re.search(r"(3D衣装|3D装飾品|3Dキャラクター|3Dテクスチャ|3Dツール・システム)", block_text)
-        if cat_match:
-            category_text = cat_match.group(1)
+        title = "vrc-sale item"
+        node = a
+        for _ in range(8):
+            if not node:
+                break
+            h = node.find(["h1", "h2", "h3", "h4"])
+            if h:
+                t = re.sub(r"\s+", " ", h.get_text(" ", strip=True)).strip()
+                if t:
+                    title = t
+                    break
+            node = node.parent
 
-        price = parse_price(block_text)
+        combined = f"{title} {block_text}".strip()
 
-        items.append({
-            "title": (title or "vrc-sale item")[:256],
+        item = {
+            "key": key,
+            "title": title[:256],
             "url": href,
-            "price": price,
-            "text": f"{title} {category_text} {block_text}".strip(),
+            "price": parse_price(combined),
+            "text": combined,
             "source": "vrc-sale",
             "source_detail": page_url,
-        })
+            "discount_percent": parse_discount_percent(combined),
+            "is_sale_hint": True,  # vrc-sale掲載はセール扱いでよい
+        }
 
-    dedup = {}
-    for item in items:
-        norm = normalize_booth_url(item["url"])
-        if "/items/" in norm:
-            item["url"] = norm
-            dedup[norm] = item
+        # 同一商品は vrc-sale 情報を優先
+        dedup[key] = item
+
+    # 念のためHTML全体からURLも拾う
+    for url in re.findall(r'https://[A-Za-z0-9_.-]+\.booth\.pm/items/\d+', html):
+        href = normalize_booth_url(url)
+        key = canonical_item_key(href)
+        if key not in dedup:
+            dedup[key] = {
+                "key": key,
+                "title": "vrc-sale item",
+                "url": href,
+                "price": None,
+                "text": "",
+                "source": "vrc-sale",
+                "source_detail": page_url,
+                "discount_percent": 0,
+                "is_sale_hint": True,
+            }
 
     return list(dedup.values())
 
 
+# =========================
+# Candidate Filtering
+# =========================
 async def enrich_and_filter_item(session: aiohttp.ClientSession, item: dict) -> Optional[dict]:
     url = item.get("url", "")
     if not url:
@@ -408,6 +530,9 @@ async def enrich_and_filter_item(session: aiohttp.ClientSession, item: dict) -> 
         return None
 
     categories = detect_categories(merged_text)
+    if not categories:
+        categories = ["未分類"]
+
     if not looks_target_item(merged_text, categories):
         return None
 
@@ -418,10 +543,39 @@ async def enrich_and_filter_item(session: aiohttp.ClientSession, item: dict) -> 
     if price is None:
         return None
 
-    if price > 1000:
+    discount_percent = max(
+        item.get("discount_percent", 0) or 0,
+        page_info.get("discount_percent", 0) or 0,
+    )
+
+    is_sale = (
+        bool(item.get("is_sale_hint"))
+        or bool(page_info.get("is_sale_hint"))
+        or looks_sale_text(merged_text)
+        or discount_percent > 0
+        or item.get("source") == "vrc-sale"
+    )
+
+    # ポーズ単体は無料のみ
+    if "ポーズ" in categories and len(categories) == 1 and price != 0:
         return None
 
+    # 無料はFREEチャンネル対象
+    if price == 0:
+        route = "free"
+    else:
+        # Bチャンネル条件
+        qualifies_b = (
+            price <= 1000
+            or is_sale
+            or discount_percent >= 50
+        )
+        if not qualifies_b:
+            return None
+        route = "b"
+
     final_item = {
+        "key": item.get("key") or canonical_item_key(url),
         "title": (page_info.get("title") or item.get("title") or "BOOTH item")[:256],
         "url": normalize_booth_url(url),
         "price": price,
@@ -431,10 +585,16 @@ async def enrich_and_filter_item(session: aiohttp.ClientSession, item: dict) -> 
         "source": item.get("source", "unknown"),
         "source_detail": item.get("source_detail", ""),
         "limited_free": looks_limited_free(merged_text),
+        "discount_percent": discount_percent,
+        "is_sale": is_sale,
+        "route": route,
     }
     return final_item
 
 
+# =========================
+# Discord Bot
+# =========================
 class BoothMonitorBot(discord.Client):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -455,13 +615,13 @@ class BoothMonitorBot(discord.Client):
         await super().close()
 
     @property
-    def seen_urls(self) -> set[str]:
-        return set(self.state.get("seen_urls", []))
+    def seen_keys(self) -> set[str]:
+        return set(self.state.get("seen_keys", []))
 
-    def add_seen_url(self, url: str):
-        s = self.seen_urls
-        s.add(normalize_booth_url(url))
-        self.state["seen_urls"] = list(s)
+    def add_seen_key(self, key: str):
+        s = self.seen_keys
+        s.add(key)
+        self.state["seen_keys"] = list(s)
 
     @property
     def reminded_keys(self) -> set[str]:
@@ -481,7 +641,9 @@ class BoothMonitorBot(discord.Client):
                 await ch.send(
                     "✅ 監視BOTが起動しました\n"
                     "対象: BOOTH検索 + vrc-sale\n"
-                    "カテゴリ: 衣装 / 髪型 / アクセサリー\n"
+                    "カテゴリ: 衣装 / 髪型 / アクセサリー / ポーズ(無料のみ)\n"
+                    "無料: FREEチャンネル\n"
+                    "Bチャンネル: 1000円以下の新着 / セール / 50%以上値引き\n"
                     "チェック間隔: 1時間\n"
                     "期間限定無料: 22時間後リマインド / 約2時間で自動削除"
                 )
@@ -499,13 +661,19 @@ class BoothMonitorBot(discord.Client):
         if source_detail:
             source_line += f" ({source_detail})"
 
+        sale_line = ""
+        if item.get("is_sale"):
+            sale_line = "🏷 セール対象\n"
+        if item.get("discount_percent", 0) > 0:
+            sale_line += f"📉 値引き率: {item['discount_percent']}%\n"
+
         limited_flag = "⏳ 期間限定無料の可能性あり\n" if item.get("limited_free") and price == 0 else ""
 
-        if price == 0:
+        if item.get("route") == "free":
             embed = discord.Embed(
                 title=item["title"],
                 url=url,
-                description=f"{limited_flag}🆓 無料アイテム\n📂 {category_text}",
+                description=f"{limited_flag}{sale_line}🆓 無料アイテム\n📂 {category_text}",
                 color=0x00CC99
             )
             ch = self.get_channel(CHANNEL_FREE)
@@ -513,10 +681,10 @@ class BoothMonitorBot(discord.Client):
             embed = discord.Embed(
                 title=item["title"],
                 url=url,
-                description=f"💰 {price}円\n📂 {category_text}",
+                description=f"{sale_line}💰 {price}円\n📂 {category_text}",
                 color=0x3399FF
             )
-            ch = self.get_channel(CHANNEL_CHEAP)
+            ch = self.get_channel(CHANNEL_B)
 
         embed.add_field(name="BOOTH", value=url, inline=False)
         embed.add_field(name="検出元", value=source_line, inline=False)
@@ -605,7 +773,9 @@ class BoothMonitorBot(discord.Client):
 
         merged = {}
         for item in candidates:
-            merged[item["url"]] = item
+            key = item["key"]
+            if key not in merged:
+                merged[key] = item
         return list(merged.values())
 
     async def fetch_vrc_sale_candidates(self) -> list[dict]:
@@ -621,7 +791,7 @@ class BoothMonitorBot(discord.Client):
 
         merged = {}
         for item in items:
-            merged[item["url"]] = item
+            merged[item["key"]] = item
         return list(merged.values())
 
     async def initialize_seen_without_notifying(self):
@@ -635,18 +805,21 @@ class BoothMonitorBot(discord.Client):
 
         dedup = {}
         for item in all_candidates:
-            dedup[item["url"]] = item
+            key = item["key"]
+            # 同じ商品は vrc-sale を優先
+            if key not in dedup or item.get("source") == "vrc-sale":
+                dedup[key] = item
 
         for item in dedup.values():
             try:
                 enriched = await enrich_and_filter_item(self.http_session, item)
                 if enriched:
-                    self.add_seen_url(enriched["url"])
+                    self.add_seen_key(enriched["key"])
             except Exception as e:
                 print(f"initialize item error {item.get('url')}: {e}")
 
         save_state(self.state)
-        print(f"初回既読化完了: {len(self.state.get('seen_urls', []))}件")
+        print(f"初回既読化完了: {len(self.state.get('seen_keys', []))}件")
 
     async def process_candidates(self, candidates: list[dict]):
         if not self.http_session:
@@ -654,18 +827,18 @@ class BoothMonitorBot(discord.Client):
 
         for item in candidates:
             try:
-                normalized = normalize_booth_url(item["url"])
-                if normalized in self.seen_urls:
+                key = item.get("key") or canonical_item_key(item["url"])
+                if key in self.seen_keys:
                     continue
 
                 enriched = await enrich_and_filter_item(self.http_session, item)
                 if not enriched:
                     continue
 
-                if enriched["url"] in self.seen_urls:
+                if enriched["key"] in self.seen_keys:
                     continue
 
-                self.add_seen_url(enriched["url"])
+                self.add_seen_key(enriched["key"])
                 await self.send_item(enriched)
                 self.queue_limited_free_reminder(enriched)
                 save_state(self.state)
@@ -678,8 +851,14 @@ class BoothMonitorBot(discord.Client):
         vrc_sale_candidates = await self.fetch_vrc_sale_candidates()
 
         merged = {}
-        for item in booth_candidates + vrc_sale_candidates:
-            merged[item["url"]] = item
+
+        # 先に BOOTH
+        for item in booth_candidates:
+            merged[item["key"]] = item
+
+        # 同一商品は vrc-sale を優先（セール情報を持ちやすい）
+        for item in vrc_sale_candidates:
+            merged[item["key"]] = item
 
         await self.process_candidates(list(merged.values()))
 
@@ -687,7 +866,11 @@ class BoothMonitorBot(discord.Client):
         await self.wait_until_ready()
 
         try:
-            await self.initialize_seen_without_notifying()
+            # 初回既読化は本当に最初の1回だけ
+            if not self.state.get("initialized_once", False):
+                await self.initialize_seen_without_notifying()
+                self.state["initialized_once"] = True
+                save_state(self.state)
         except Exception as e:
             print(f"initialization error: {e}")
 
