@@ -1,12 +1,11 @@
-import discord
 import asyncio
+import json
 import os
 import re
-import json
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from urllib.parse import quote
-from datetime import datetime, timedelta, timezone
 
 import aiohttp
 from bs4 import BeautifulSoup
@@ -18,47 +17,24 @@ DISCORD_TOKEN = os.getenv("TOKEN")
 if not DISCORD_TOKEN:
     raise RuntimeError("TOKEN が未設定です")
 
-# =========================
-# Discord Channels
-# =========================
-CHANNEL_FREE = 1481284062789374013
-CHANNEL_B = 1481283710660907242
+CHANNEL_FREE = int(os.getenv("CHANNEL_FREE", "1481284062789374013"))
+CHANNEL_B = int(os.getenv("CHANNEL_B", "1481283710660907242"))
 
-# =========================
-# Files
-# =========================
 STATE_FILE = "state.json"
 
-# =========================
-# Timezone
-# =========================
 JST = timezone(timedelta(hours=9))
 
-# =========================
-# Monitoring Settings
-# =========================
-CHECK_INTERVAL = 60 * 60
 REMINDER_AFTER = 22 * 60 * 60
 REMINDER_DELETE_AFTER = 2 * 60 * 60
-REMINDER_POLL_INTERVAL = 60
 
-# =========================
-# BOOTH Search
-# =========================
 SEARCH_KEYWORDS = [
     "VRChat",
     "VRC想定モデル",
     "VRChat可",
 ]
 
-# =========================
-# vrc-sale
-# =========================
 VRC_SALE_BASE = "https://vrc-sale.com/sales"
 
-# =========================
-# Filters
-# =========================
 NEGATIVE_WORDS = [
     # 素材系
     "素材", "テクスチャ", "texture", "matcap", "shader", "preset",
@@ -73,6 +49,19 @@ NEGATIVE_WORDS = [
     "モーション", "motion", "animation", "アニメーション",
     "animator", "gesture", "fx", "ダンス", "振り付け",
 
+    # 二次創作グッズ系
+    "二次創作", "fanart", "ファンアート", "アクリル", "アクキー",
+    "アクリルキーホルダー", "缶バッジ", "ステッカー", "ポスター",
+    "タペストリー", "キーホルダー", "ぬいぐるみ", "グッズ",
+    "抱き枕", "抱き枕カバー", "クリアファイル", "同人グッズ",
+
+    # ワールドアイテム系
+    "world item", "worlditem", "ワールド", "ワールド用", "ワールド向け",
+    "ワールド専用", "ワールド配置", "ワールド設置",
+    "u#don", "udon", "udonsharp", "pickup", "pick up",
+    "interact", "ギミック", "オブジェクト", "cluster",
+
+    # その他対象外になりやすいもの
     "live2d", "aviutl", "after effects", "動画素材",
 ]
 
@@ -137,12 +126,7 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0"
 }
 
-intents = discord.Intents.default()
 
-
-# =========================
-# State Helpers
-# =========================
 def extract_item_id(url: str) -> Optional[str]:
     if not url:
         return None
@@ -162,7 +146,7 @@ def canonical_item_key(url: str) -> str:
 def load_state():
     default_state = {
         "seen_keys": [],
-        "seen_urls": [],        # 旧互換
+        "seen_urls": [],
         "reminders": [],
         "reminded_keys": [],
         "initialized_once": False,
@@ -177,7 +161,6 @@ def load_state():
         if k not in data:
             data[k] = v
 
-    # 旧 seen_urls から seen_keys へ移行
     seen_keys = set(data.get("seen_keys", []))
     for url in data.get("seen_urls", []):
         seen_keys.add(canonical_item_key(url))
@@ -189,7 +172,7 @@ def load_state():
 def save_state(state):
     tmp = {
         "seen_keys": sorted(list(set(state.get("seen_keys", [])))),
-        "seen_urls": [],  # 新コードでは使わない
+        "seen_urls": [],
         "reminders": state.get("reminders", []),
         "reminded_keys": sorted(list(set(state.get("reminded_keys", [])))),
         "initialized_once": state.get("initialized_once", False),
@@ -212,9 +195,6 @@ def build_vrc_sale_url(date_str: Optional[str] = None) -> str:
     return f"{VRC_SALE_BASE}/{date_str}"
 
 
-# =========================
-# General Helpers
-# =========================
 def build_search_url(keyword: str) -> str:
     encoded = quote(keyword)
     return f"https://booth.pm/ja/search/{encoded}?sort=new"
@@ -257,6 +237,8 @@ def parse_discount_percent(text: str) -> int:
     if not text:
         return 0
 
+    best = 0
+
     patterns = [
         r"([0-9]{1,3})\s*%",
         r"([0-9]{1,3})\s*％",
@@ -265,9 +247,9 @@ def parse_discount_percent(text: str) -> int:
         r"([0-9]{1,3})\s*OFF",
         r"([0-9]{1,3})\s*割引",
         r"([0-9]{1,3})\s*引き",
+        r"([0-9]{1,3})\s*オフ",
     ]
 
-    best = 0
     for pattern in patterns:
         for m in re.finditer(pattern, text, re.IGNORECASE):
             try:
@@ -276,6 +258,21 @@ def parse_discount_percent(text: str) -> int:
                     best = max(best, value)
             except Exception:
                 pass
+
+    # 「通常 2000円 → 1000円」みたいな表記から割引率を推定
+    yen_prices = re.findall(r'([0-9][0-9,]*)\s*円', text)
+    if len(yen_prices) >= 2:
+        try:
+            nums = [int(x.replace(",", "")) for x in yen_prices[:6]]
+            high = max(nums)
+            low = min(nums)
+            if high > 0 and low < high:
+                inferred = int(round((high - low) / high * 100))
+                if 0 < inferred <= 100:
+                    best = max(best, inferred)
+        except Exception:
+            pass
+
     return best
 
 
@@ -302,12 +299,8 @@ def detect_categories(text: str) -> list[str]:
 
 def looks_target_item(text: str, categories: list[str]) -> bool:
     lower = text.lower()
-
-    # 共通3D/VRChat文脈があればOK
     if any(word.lower() in lower for word in COMMON_POSITIVE_WORDS):
         return True
-
-    # 未分類も拾う
     return True
 
 
@@ -322,12 +315,9 @@ def reminder_key(url: str) -> str:
     return f"reminder::{canonical_item_key(url)}"
 
 
-# =========================
-# HTTP Helpers
-# =========================
-async def fetch_text(session: aiohttp.ClientSession, url: str, headers: dict | None = None) -> Optional[str]:
+async def fetch_text(session: aiohttp.ClientSession, url: str) -> Optional[str]:
     try:
-        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=25)) as resp:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=25)) as resp:
             resp.raise_for_status()
             return await resp.text()
     except Exception as e:
@@ -335,9 +325,6 @@ async def fetch_text(session: aiohttp.ClientSession, url: str, headers: dict | N
         return None
 
 
-# =========================
-# BOOTH Parsing
-# =========================
 def extract_items_from_search_html(html: str):
     soup = BeautifulSoup(html, "html.parser")
     items = []
@@ -371,6 +358,92 @@ def extract_items_from_search_html(html: str):
     dedup = {}
     for item in items:
         dedup[item["key"]] = item
+    return list(dedup.values())
+
+
+def extract_items_from_vrc_sale_html(html: str, page_url: str) -> list[dict]:
+    soup = BeautifulSoup(html, "html.parser")
+    dedup = {}
+
+    all_urls = re.findall(r'https://[A-Za-z0-9_.-]+\.booth\.pm/items/\d+', html)
+
+    for a in soup.select('a[href*="booth.pm"]'):
+        href = a.get("href", "")
+        if href and "booth.pm" in href and "/items/" in href:
+            all_urls.append(href)
+
+    normalized_urls = []
+    seen_url_set = set()
+    for raw_url in all_urls:
+        norm = normalize_booth_url(raw_url)
+        if not norm or "/items/" not in norm:
+            continue
+        if norm in seen_url_set:
+            continue
+        seen_url_set.add(norm)
+        normalized_urls.append(norm)
+
+    for href in normalized_urls:
+        key = canonical_item_key(href)
+        context_texts = []
+
+        for a in soup.select('a[href*="booth.pm"]'):
+            raw = a.get("href", "")
+            if not raw:
+                continue
+            if normalize_booth_url(raw) != href:
+                continue
+
+            node = a
+            for _ in range(6):
+                if not node:
+                    break
+                try:
+                    text = re.sub(r"\s+", " ", node.get_text(" ", strip=True)).strip()
+                    if text:
+                        context_texts.append(text)
+                except Exception:
+                    pass
+                node = node.parent
+
+        combined = " ".join(context_texts)
+        combined = re.sub(r"\s+", " ", combined).strip()
+
+        title = "vrc-sale item"
+        for a in soup.select('a[href*="booth.pm"]'):
+            raw = a.get("href", "")
+            if not raw:
+                continue
+            if normalize_booth_url(raw) != href:
+                continue
+
+            node = a
+            for _ in range(8):
+                if not node:
+                    break
+                h = node.find(["h1", "h2", "h3", "h4"])
+                if h:
+                    t = re.sub(r"\s+", " ", h.get_text(" ", strip=True)).strip()
+                    if t:
+                        title = t
+                        break
+                node = node.parent
+
+            if title != "vrc-sale item":
+                break
+
+        dedup[key] = {
+            "key": key,
+            "title": title[:256],
+            "url": href,
+            "price": parse_price(combined),
+            "text": combined,
+            "source": "vrc-sale",
+            "source_detail": page_url,
+            "discount_percent": parse_discount_percent(combined),
+            "is_sale_hint": True,
+        }
+
     return list(dedup.values())
 
 
@@ -430,89 +503,6 @@ async def get_product_page_info(session: aiohttp.ClientSession, url: str) -> dic
         }
 
 
-# =========================
-# vrc-sale Parsing
-# =========================
-def extract_items_from_vrc_sale_html(html: str, page_url: str) -> list[dict]:
-    soup = BeautifulSoup(html, "html.parser")
-    items = []
-    dedup = {}
-
-    for a in soup.select('a[href*="booth.pm/items/"]'):
-        href = normalize_booth_url(a.get("href", ""))
-        if not href:
-            continue
-
-        key = canonical_item_key(href)
-
-        block_text = ""
-        node = a
-        for _ in range(6):
-            if not node:
-                break
-            block_text = node.get_text(" ", strip=True)
-            if block_text and len(block_text) >= 20:
-                break
-            node = node.parent
-
-        # 周辺テキストを多めに拾う
-        if a.parent:
-            parent_text = a.parent.get_text(" ", strip=True)
-            block_text = f"{block_text} {parent_text}".strip()
-
-        title = "vrc-sale item"
-        node = a
-        for _ in range(8):
-            if not node:
-                break
-            h = node.find(["h1", "h2", "h3", "h4"])
-            if h:
-                t = re.sub(r"\s+", " ", h.get_text(" ", strip=True)).strip()
-                if t:
-                    title = t
-                    break
-            node = node.parent
-
-        combined = f"{title} {block_text}".strip()
-
-        item = {
-            "key": key,
-            "title": title[:256],
-            "url": href,
-            "price": parse_price(combined),
-            "text": combined,
-            "source": "vrc-sale",
-            "source_detail": page_url,
-            "discount_percent": parse_discount_percent(combined),
-            "is_sale_hint": True,  # vrc-sale掲載はセール扱いでよい
-        }
-
-        # 同一商品は vrc-sale 情報を優先
-        dedup[key] = item
-
-    # 念のためHTML全体からURLも拾う
-    for url in re.findall(r'https://[A-Za-z0-9_.-]+\.booth\.pm/items/\d+', html):
-        href = normalize_booth_url(url)
-        key = canonical_item_key(href)
-        if key not in dedup:
-            dedup[key] = {
-                "key": key,
-                "title": "vrc-sale item",
-                "url": href,
-                "price": None,
-                "text": "",
-                "source": "vrc-sale",
-                "source_detail": page_url,
-                "discount_percent": 0,
-                "is_sale_hint": True,
-            }
-
-    return list(dedup.values())
-
-
-# =========================
-# Candidate Filtering
-# =========================
 async def enrich_and_filter_item(session: aiohttp.ClientSession, item: dict) -> Optional[dict]:
     url = item.get("url", "")
     if not url:
@@ -525,6 +515,22 @@ async def enrich_and_filter_item(session: aiohttp.ClientSession, item: dict) -> 
         page_info.get("title") or "",
         page_info.get("text") or "",
     ]).strip()
+
+    # 強め除外
+    strong_exclude_patterns = [
+        r"ワールド(専用|向け|用)",
+        r"world( item|用|専用)?",
+        r"u#don",
+        r"\budon\b",
+        r"アクリル",
+        r"缶バッジ",
+        r"キーホルダー",
+        r"ステッカー",
+        r"ぬいぐるみ",
+    ]
+    for pattern in strong_exclude_patterns:
+        if re.search(pattern, merged_text, re.IGNORECASE):
+            return None
 
     if should_exclude(merged_text):
         return None
@@ -560,26 +566,23 @@ async def enrich_and_filter_item(session: aiohttp.ClientSession, item: dict) -> 
     if "ポーズ" in categories and len(categories) == 1 and price != 0:
         return None
 
-    # 無料はFREEチャンネル対象
     if price == 0:
         route = "free"
     else:
-        # Bチャンネル条件
         qualifies_b = (
             price <= 1000
-            or is_sale
-            or discount_percent >= 50
+            or (price > 1000 and discount_percent >= 50)
+            or (price <= 1000 and is_sale)
         )
         if not qualifies_b:
             return None
         route = "b"
 
-    final_item = {
+    return {
         "key": item.get("key") or canonical_item_key(url),
         "title": (page_info.get("title") or item.get("title") or "BOOTH item")[:256],
         "url": normalize_booth_url(url),
         "price": price,
-        "text": merged_text,
         "categories": categories,
         "image": page_info.get("image"),
         "source": item.get("source", "unknown"),
@@ -589,326 +592,266 @@ async def enrich_and_filter_item(session: aiohttp.ClientSession, item: dict) -> 
         "is_sale": is_sale,
         "route": route,
     }
-    return final_item
 
 
-# =========================
-# Discord Bot
-# =========================
-class BoothMonitorBot(discord.Client):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.http_session: Optional[aiohttp.ClientSession] = None
-        self.state = load_state()
-        self.initialized = False
-        self.monitor_task = None
-        self.reminder_task = None
+async def discord_api(session: aiohttp.ClientSession, method: str, path: str, **kwargs):
+    headers = kwargs.pop("headers", {})
+    headers["Authorization"] = f"Bot {DISCORD_TOKEN}"
+    headers["Content-Type"] = "application/json"
+    url = f"https://discord.com/api/v10{path}"
+    async with session.request(method, url, headers=headers, **kwargs) as resp:
+        text = await resp.text()
+        if resp.status >= 400:
+            raise RuntimeError(f"Discord API error {resp.status}: {text}")
+        if text:
+            return json.loads(text)
+        return None
 
-    async def setup_hook(self):
-        self.http_session = aiohttp.ClientSession(headers=HEADERS)
-        self.monitor_task = asyncio.create_task(self.monitor_loop())
-        self.reminder_task = asyncio.create_task(self.reminder_loop())
 
-    async def close(self):
-        if self.http_session and not self.http_session.closed:
-            await self.http_session.close()
-        await super().close()
+def build_embed(item: dict) -> dict:
+    category_text = " / ".join(item.get("categories", [])) if item.get("categories") else "未分類"
 
-    @property
-    def seen_keys(self) -> set[str]:
-        return set(self.state.get("seen_keys", []))
+    source_text = item.get("source", "unknown")
+    source_detail = item.get("source_detail", "")
+    source_line = source_text if not source_detail else f"{source_text} ({source_detail})"
 
-    def add_seen_key(self, key: str):
-        s = self.seen_keys
-        s.add(key)
-        self.state["seen_keys"] = list(s)
+    sale_line = ""
+    if item.get("is_sale"):
+        sale_line += "🏷 セール対象\n"
+    if item.get("discount_percent", 0) > 0:
+        sale_line += f"📉 値引き率: {item['discount_percent']}%\n"
 
-    @property
-    def reminded_keys(self) -> set[str]:
-        return set(self.state.get("reminded_keys", []))
+    limited_flag = ""
+    if item.get("limited_free") and item.get("price") == 0:
+        limited_flag = "⏳ 期間限定無料の可能性あり\n"
 
-    def add_reminded_key(self, key: str):
-        s = self.reminded_keys
-        s.add(key)
-        self.state["reminded_keys"] = list(s)
+    if item.get("route") == "free":
+        description = f"{limited_flag}{sale_line}🆓 無料アイテム\n📂 {category_text}"
+        color = 0x00CC99
+    else:
+        description = f"{sale_line}💰 {item['price']}円\n📂 {category_text}"
+        color = 0x3399FF
 
-    async def on_ready(self):
-        print(f"BOT起動: {self.user}")
-        if not self.initialized:
-            self.initialized = True
-            ch = self.get_channel(CHANNEL_FREE)
-            if ch:
-                await ch.send(
-                    "✅ 監視BOTが起動しました\n"
-                    "対象: BOOTH検索 + vrc-sale\n"
-                    "カテゴリ: 衣装 / 髪型 / アクセサリー / ポーズ(無料のみ)\n"
-                    "無料: FREEチャンネル\n"
-                    "Bチャンネル: 1000円以下の新着 / セール / 50%以上値引き\n"
-                    "チェック間隔: 1時間\n"
-                    "期間限定無料: 22時間後リマインド / 約2時間で自動削除"
-                )
+    embed = {
+        "title": item["title"][:256],
+        "url": item["url"],
+        "description": description[:4096],
+        "color": color,
+        "fields": [
+            {"name": "BOOTH", "value": item["url"], "inline": False},
+            {"name": "検出元", "value": source_line[:1024], "inline": False},
+        ],
+        "footer": {"text": "BOOTH / vrc-sale monitor"},
+    }
 
-    async def send_item(self, item: dict):
-        price = item["price"]
-        url = item["url"]
-        categories = item.get("categories", [])
-        image = item.get("image")
-        category_text = " / ".join(categories) if categories else "未分類"
+    if item.get("image"):
+        embed["image"] = {"url": item["image"]}
 
-        source_text = item.get("source", "unknown")
-        source_detail = item.get("source_detail", "")
-        source_line = source_text
-        if source_detail:
-            source_line += f" ({source_detail})"
+    return embed
 
-        sale_line = ""
-        if item.get("is_sale"):
-            sale_line = "🏷 セール対象\n"
-        if item.get("discount_percent", 0) > 0:
-            sale_line += f"📉 値引き率: {item['discount_percent']}%\n"
 
-        limited_flag = "⏳ 期間限定無料の可能性あり\n" if item.get("limited_free") and price == 0 else ""
+async def send_item(session: aiohttp.ClientSession, item: dict):
+    channel_id = CHANNEL_FREE if item.get("route") == "free" else CHANNEL_B
+    payload = {"embeds": [build_embed(item)]}
+    await discord_api(session, "POST", f"/channels/{channel_id}/messages", data=json.dumps(payload))
 
-        if item.get("route") == "free":
-            embed = discord.Embed(
-                title=item["title"],
-                url=url,
-                description=f"{limited_flag}{sale_line}🆓 無料アイテム\n📂 {category_text}",
-                color=0x00CC99
-            )
-            ch = self.get_channel(CHANNEL_FREE)
-        else:
-            embed = discord.Embed(
-                title=item["title"],
-                url=url,
-                description=f"{sale_line}💰 {price}円\n📂 {category_text}",
-                color=0x3399FF
-            )
-            ch = self.get_channel(CHANNEL_B)
 
-        embed.add_field(name="BOOTH", value=url, inline=False)
-        embed.add_field(name="検出元", value=source_line, inline=False)
+async def send_reminder(session: aiohttp.ClientSession, rem: dict):
+    category_text = " / ".join(rem.get("categories", [])) if rem.get("categories") else "未分類"
 
-        if image:
-            embed.set_image(url=image)
+    source_text = rem.get("source", "")
+    source_detail = rem.get("source_detail", "")
+    source_line = source_text if not source_detail else f"{source_text} ({source_detail})"
 
-        embed.set_footer(text="BOOTH / vrc-sale monitor")
+    embed = {
+        "title": f"⏰ 期間限定無料リマインド: {rem.get('title', 'BOOTH item')[:220]}",
+        "url": rem["url"],
+        "description": "22時間前に検出した期間限定無料の可能性があるアイテムです。\n終了前か確認してください。",
+        "color": 0xFFAA33,
+        "fields": [
+            {"name": "BOOTH", "value": rem["url"], "inline": False},
+            {"name": "カテゴリ", "value": category_text[:1024], "inline": False},
+            {"name": "検出元", "value": source_line[:1024], "inline": False},
+        ],
+        "footer": {"text": "This reminder will auto-delete in about 2 hours"},
+    }
 
-        if ch:
-            await ch.send(embed=embed)
+    if rem.get("image"):
+        embed["image"] = {"url": rem["image"]}
 
-    async def send_reminder(self, rem: dict):
-        ch = self.get_channel(CHANNEL_FREE)
-        if not ch:
-            return
+    payload = {
+        "embeds": [embed],
+    }
+    message = await discord_api(session, "POST", f"/channels/{CHANNEL_FREE}/messages", data=json.dumps(payload))
 
-        categories = rem.get("categories", [])
-        category_text = " / ".join(categories) if categories else "未分類"
+    if message and "id" in message:
+        rem["delete_at"] = now_ts() + REMINDER_DELETE_AFTER
+        rem["message_id"] = message["id"]
 
-        embed = discord.Embed(
-            title=f"⏰ 期間限定無料リマインド: {rem.get('title', 'BOOTH item')[:220]}",
-            url=rem["url"],
-            description=(
-                "22時間前に検出した期間限定無料の可能性があるアイテムです。\n"
-                "終了前か確認してください。"
-            ),
-            color=0xFFAA33,
-        )
-        embed.add_field(name="BOOTH", value=rem["url"], inline=False)
-        embed.add_field(name="カテゴリ", value=category_text, inline=False)
 
-        src = rem.get("source", "")
-        src_detail = rem.get("source_detail", "")
-        source_line = src if not src_detail else f"{src} ({src_detail})"
-        if source_line:
-            embed.add_field(name="検出元", value=source_line, inline=False)
+async def delete_message(session: aiohttp.ClientSession, channel_id: int, message_id: str):
+    await discord_api(session, "DELETE", f"/channels/{channel_id}/messages/{message_id}")
 
-        image = rem.get("image")
-        if image:
-            embed.set_image(url=image)
 
-        embed.set_footer(text="This reminder will auto-delete in about 2 hours")
-
-        await ch.send(embed=embed, delete_after=REMINDER_DELETE_AFTER)
-
-    def queue_limited_free_reminder(self, item: dict):
-        if item.get("price") != 0:
-            return
-        if not item.get("limited_free"):
-            return
-
-        key = reminder_key(item["url"])
-        if key in self.reminded_keys:
-            return
-
-        due_at = now_ts() + REMINDER_AFTER
-        reminder = {
-            "key": key,
-            "due_at": due_at,
-            "url": item["url"],
-            "title": item["title"],
-            "categories": item.get("categories", []),
-            "image": item.get("image"),
-            "source": item.get("source", ""),
-            "source_detail": item.get("source_detail", ""),
-        }
-        self.state.setdefault("reminders", []).append(reminder)
-        self.add_reminded_key(key)
-
-    async def fetch_booth_candidates(self) -> list[dict]:
-        if not self.http_session:
-            return []
-
-        candidates = []
-        for keyword in SEARCH_KEYWORDS:
-            search_url = build_search_url(keyword)
-            html = await fetch_text(self.http_session, search_url)
-            if not html:
-                continue
-            items = extract_items_from_search_html(html)
-            for item in items:
-                item["source"] = "booth_search"
-                item["source_detail"] = keyword
-            candidates.extend(items)
-
-        merged = {}
-        for item in candidates:
-            key = item["key"]
-            if key not in merged:
-                merged[key] = item
-        return list(merged.values())
-
-    async def fetch_vrc_sale_candidates(self) -> list[dict]:
-        if not self.http_session:
-            return []
-
-        page_url = build_vrc_sale_url()
-        html = await fetch_text(self.http_session, page_url)
+async def fetch_booth_candidates(session: aiohttp.ClientSession) -> list[dict]:
+    candidates = []
+    for keyword in SEARCH_KEYWORDS:
+        search_url = build_search_url(keyword)
+        html = await fetch_text(session, search_url)
         if not html:
-            return []
+            continue
+        items = extract_items_from_search_html(html)
+        for item in items:
+            item["source"] = "booth_search"
+            item["source_detail"] = keyword
+        candidates.extend(items)
+
+    merged = {}
+    for item in candidates:
+        merged[item["key"]] = item
+    return list(merged.values())
+
+
+async def fetch_vrc_sale_candidates(session: aiohttp.ClientSession) -> list[dict]:
+    pages = [
+        build_vrc_sale_url(),
+        build_vrc_sale_url((datetime.now(JST) - timedelta(days=1)).strftime("%Y-%m-%d")),
+    ]
+
+    merged = {}
+
+    for page_url in pages:
+        html = await fetch_text(session, page_url)
+        if not html:
+            continue
 
         items = extract_items_from_vrc_sale_html(html, page_url)
-
-        merged = {}
         for item in items:
             merged[item["key"]] = item
-        return list(merged.values())
 
-    async def initialize_seen_without_notifying(self):
-        if not self.http_session:
-            return
+    return list(merged.values())
 
-        print("初回既読化を開始")
-        all_candidates = []
-        all_candidates.extend(await self.fetch_booth_candidates())
-        all_candidates.extend(await self.fetch_vrc_sale_candidates())
 
-        dedup = {}
-        for item in all_candidates:
-            key = item["key"]
-            # 同じ商品は vrc-sale を優先
-            if key not in dedup or item.get("source") == "vrc-sale":
-                dedup[key] = item
+def queue_limited_free_reminder(state: dict, item: dict):
+    if item.get("price") != 0:
+        return
+    if not item.get("limited_free"):
+        return
 
-        for item in dedup.values():
-            try:
-                enriched = await enrich_and_filter_item(self.http_session, item)
-                if enriched:
-                    self.add_seen_key(enriched["key"])
-            except Exception as e:
-                print(f"initialize item error {item.get('url')}: {e}")
+    key = reminder_key(item["url"])
+    reminded = set(state.get("reminded_keys", []))
+    if key in reminded:
+        return
 
-        save_state(self.state)
-        print(f"初回既読化完了: {len(self.state.get('seen_keys', []))}件")
+    due_at = now_ts() + REMINDER_AFTER
+    reminder = {
+        "key": key,
+        "due_at": due_at,
+        "url": item["url"],
+        "title": item["title"],
+        "categories": item.get("categories", []),
+        "image": item.get("image"),
+        "source": item.get("source", ""),
+        "source_detail": item.get("source_detail", ""),
+    }
+    state.setdefault("reminders", []).append(reminder)
+    reminded.add(key)
+    state["reminded_keys"] = list(reminded)
 
-    async def process_candidates(self, candidates: list[dict]):
-        if not self.http_session:
-            return
 
-        for item in candidates:
-            try:
-                key = item.get("key") or canonical_item_key(item["url"])
-                if key in self.seen_keys:
-                    continue
+async def initialize_seen_without_notifying(session: aiohttp.ClientSession, state: dict):
+    all_candidates = []
+    all_candidates.extend(await fetch_booth_candidates(session))
+    all_candidates.extend(await fetch_vrc_sale_candidates(session))
 
-                enriched = await enrich_and_filter_item(self.http_session, item)
-                if not enriched:
-                    continue
+    dedup = {}
+    for item in all_candidates:
+        key = item["key"]
+        if key not in dedup or item.get("source") == "vrc-sale":
+            dedup[key] = item
 
-                if enriched["key"] in self.seen_keys:
-                    continue
-
-                self.add_seen_key(enriched["key"])
-                await self.send_item(enriched)
-                self.queue_limited_free_reminder(enriched)
-                save_state(self.state)
-
-            except Exception as e:
-                print(f"process item error {item.get('url')}: {e}")
-
-    async def monitor_once(self):
-        booth_candidates = await self.fetch_booth_candidates()
-        vrc_sale_candidates = await self.fetch_vrc_sale_candidates()
-
-        merged = {}
-
-        # 先に BOOTH
-        for item in booth_candidates:
-            merged[item["key"]] = item
-
-        # 同一商品は vrc-sale を優先（セール情報を持ちやすい）
-        for item in vrc_sale_candidates:
-            merged[item["key"]] = item
-
-        await self.process_candidates(list(merged.values()))
-
-    async def monitor_loop(self):
-        await self.wait_until_ready()
-
+    seen = set(state.get("seen_keys", []))
+    for item in dedup.values():
         try:
-            # 初回既読化は本当に最初の1回だけ
-            if not self.state.get("initialized_once", False):
-                await self.initialize_seen_without_notifying()
-                self.state["initialized_once"] = True
-                save_state(self.state)
+            enriched = await enrich_and_filter_item(session, item)
+            if enriched:
+                seen.add(enriched["key"])
         except Exception as e:
-            print(f"initialization error: {e}")
+            print(f"initialize item error {item.get('url')}: {e}")
 
-        while not self.is_closed():
-            try:
-                await self.monitor_once()
-                save_state(self.state)
-            except Exception as e:
-                print(f"monitor loop error: {e}")
-
-            await asyncio.sleep(CHECK_INTERVAL)
-
-    async def reminder_loop(self):
-        await self.wait_until_ready()
-
-        while not self.is_closed():
-            try:
-                reminders = self.state.get("reminders", [])
-                remaining = []
-                current = now_ts()
-
-                for rem in reminders:
-                    if rem.get("due_at", 0) <= current:
-                        try:
-                            await self.send_reminder(rem)
-                        except Exception as e:
-                            print(f"send reminder error {rem.get('url')}: {e}")
-                    else:
-                        remaining.append(rem)
-
-                self.state["reminders"] = remaining
-                save_state(self.state)
-
-            except Exception as e:
-                print(f"reminder loop error: {e}")
-
-            await asyncio.sleep(REMINDER_POLL_INTERVAL)
+    state["seen_keys"] = list(seen)
+    state["initialized_once"] = True
 
 
-client = BoothMonitorBot(intents=intents)
-client.run(DISCORD_TOKEN)
+async def process_reminders(session: aiohttp.ClientSession, state: dict):
+    reminders = state.get("reminders", [])
+    remaining = []
+    current = now_ts()
+
+    for rem in reminders:
+        try:
+            if rem.get("due_at", 0) <= current and not rem.get("message_id"):
+                await send_reminder(session, rem)
+                remaining.append(rem)
+            elif rem.get("message_id") and rem.get("delete_at", 0) <= current:
+                await delete_message(session, CHANNEL_FREE, rem["message_id"])
+            else:
+                remaining.append(rem)
+        except Exception as e:
+            print(f"reminder error {rem.get('url')}: {e}")
+            remaining.append(rem)
+
+    state["reminders"] = remaining
+
+
+async def process_candidates(session: aiohttp.ClientSession, state: dict):
+    booth_candidates = await fetch_booth_candidates(session)
+    vrc_sale_candidates = await fetch_vrc_sale_candidates(session)
+
+    merged = {}
+    for item in booth_candidates:
+        merged[item["key"]] = item
+    for item in vrc_sale_candidates:
+        merged[item["key"]] = item
+
+    seen = set(state.get("seen_keys", []))
+
+    for item in merged.values():
+        try:
+            if item["key"] in seen:
+                continue
+
+            enriched = await enrich_and_filter_item(session, item)
+            if not enriched:
+                continue
+
+            if enriched["key"] in seen:
+                continue
+
+            await send_item(session, enriched)
+            queue_limited_free_reminder(state, enriched)
+            seen.add(enriched["key"])
+        except Exception as e:
+            print(f"process item error {item.get('url')}: {e}")
+
+    state["seen_keys"] = list(seen)
+
+
+async def main():
+    state = load_state()
+
+    async with aiohttp.ClientSession(headers=HEADERS) as session:
+        if not state.get("initialized_once", False):
+            print("初回既読化を開始")
+            await initialize_seen_without_notifying(session, state)
+            print("初回既読化完了")
+        else:
+            await process_reminders(session, state)
+            await process_candidates(session, state)
+
+    save_state(state)
+    print("処理完了")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
