@@ -259,7 +259,6 @@ def parse_discount_percent(text: str) -> int:
             except Exception:
                 pass
 
-    # 「通常 2000円 → 1000円」みたいな表記から割引率を推定
     yen_prices = re.findall(r'([0-9][0-9,]*)\s*円', text)
     if len(yen_prices) >= 2:
         try:
@@ -516,7 +515,6 @@ async def enrich_and_filter_item(session: aiohttp.ClientSession, item: dict) -> 
         page_info.get("text") or "",
     ]).strip()
 
-    # 強め除外
     strong_exclude_patterns = [
         r"ワールド(専用|向け|用)",
         r"world( item|用|専用)?",
@@ -530,9 +528,11 @@ async def enrich_and_filter_item(session: aiohttp.ClientSession, item: dict) -> 
     ]
     for pattern in strong_exclude_patterns:
         if re.search(pattern, merged_text, re.IGNORECASE):
+            print(f"FILTER strong_exclude: {normalize_booth_url(url)}")
             return None
 
     if should_exclude(merged_text):
+        print(f"FILTER negative_words: {normalize_booth_url(url)}")
         return None
 
     categories = detect_categories(merged_text)
@@ -540,6 +540,7 @@ async def enrich_and_filter_item(session: aiohttp.ClientSession, item: dict) -> 
         categories = ["未分類"]
 
     if not looks_target_item(merged_text, categories):
+        print(f"FILTER looks_target_item: {normalize_booth_url(url)}")
         return None
 
     price = item.get("price")
@@ -547,6 +548,7 @@ async def enrich_and_filter_item(session: aiohttp.ClientSession, item: dict) -> 
         price = page_info.get("price")
 
     if price is None:
+        print(f"FILTER price_none: {normalize_booth_url(url)}")
         return None
 
     discount_percent = max(
@@ -562,8 +564,8 @@ async def enrich_and_filter_item(session: aiohttp.ClientSession, item: dict) -> 
         or item.get("source") == "vrc-sale"
     )
 
-    # ポーズ単体は無料のみ
     if "ポーズ" in categories and len(categories) == 1 and price != 0:
+        print(f"FILTER pose_paid: {normalize_booth_url(url)}")
         return None
 
     if price == 0:
@@ -575,8 +577,30 @@ async def enrich_and_filter_item(session: aiohttp.ClientSession, item: dict) -> 
             or (price <= 1000 and is_sale)
         )
         if not qualifies_b:
+            print(
+                "FILTER b_condition:",
+                {
+                    "url": normalize_booth_url(url),
+                    "price": price,
+                    "discount_percent": discount_percent,
+                    "is_sale": is_sale,
+                }
+            )
             return None
         route = "b"
+
+    print(
+        "DEBUG enrich:",
+        {
+            "title": (page_info.get("title") or item.get("title") or "")[:60],
+            "price": price,
+            "categories": categories,
+            "discount_percent": discount_percent,
+            "is_sale": is_sale,
+            "route": route,
+            "url": normalize_booth_url(url),
+        }
+    )
 
     return {
         "key": item.get("key") or canonical_item_key(url),
@@ -679,9 +703,7 @@ async def send_reminder(session: aiohttp.ClientSession, rem: dict):
     if rem.get("image"):
         embed["image"] = {"url": rem["image"]}
 
-    payload = {
-        "embeds": [embed],
-    }
+    payload = {"embeds": [embed]}
     message = await discord_api(session, "POST", f"/channels/{CHANNEL_FREE}/messages", data=json.dumps(payload))
 
     if message and "id" in message:
@@ -771,16 +793,20 @@ async def initialize_seen_without_notifying(session: aiohttp.ClientSession, stat
             dedup[key] = item
 
     seen = set(state.get("seen_keys", []))
+    added = 0
+
     for item in dedup.values():
         try:
             enriched = await enrich_and_filter_item(session, item)
             if enriched:
                 seen.add(enriched["key"])
+                added += 1
         except Exception as e:
             print(f"initialize item error {item.get('url')}: {e}")
 
     state["seen_keys"] = list(seen)
     state["initialized_once"] = True
+    print(f"DEBUG initialize_seen added={added}")
 
 
 async def process_reminders(session: aiohttp.ClientSession, state: dict):
@@ -802,11 +828,15 @@ async def process_reminders(session: aiohttp.ClientSession, state: dict):
             remaining.append(rem)
 
     state["reminders"] = remaining
+    print(f"DEBUG reminders_remaining={len(remaining)}")
 
 
 async def process_candidates(session: aiohttp.ClientSession, state: dict):
     booth_candidates = await fetch_booth_candidates(session)
     vrc_sale_candidates = await fetch_vrc_sale_candidates(session)
+
+    print(f"DEBUG booth_candidates={len(booth_candidates)}")
+    print(f"DEBUG vrc_sale_candidates={len(vrc_sale_candidates)}")
 
     merged = {}
     for item in booth_candidates:
@@ -814,27 +844,48 @@ async def process_candidates(session: aiohttp.ClientSession, state: dict):
     for item in vrc_sale_candidates:
         merged[item["key"]] = item
 
+    print(f"DEBUG merged_candidates={len(merged)}")
+
     seen = set(state.get("seen_keys", []))
+    posted = 0
 
     for item in merged.values():
         try:
             if item["key"] in seen:
+                print(f"SKIP seen: {item['url']}")
                 continue
 
             enriched = await enrich_and_filter_item(session, item)
             if not enriched:
+                print(f"SKIP filtered: {item['url']}")
                 continue
 
             if enriched["key"] in seen:
+                print(f"SKIP seen after enrich: {enriched['url']}")
                 continue
+
+            print(
+                "POST:",
+                {
+                    "title": enriched["title"][:60],
+                    "price": enriched["price"],
+                    "route": enriched["route"],
+                    "discount_percent": enriched["discount_percent"],
+                    "is_sale": enriched["is_sale"],
+                    "url": enriched["url"],
+                }
+            )
 
             await send_item(session, enriched)
             queue_limited_free_reminder(state, enriched)
             seen.add(enriched["key"])
+            posted += 1
+
         except Exception as e:
             print(f"process item error {item.get('url')}: {e}")
 
     state["seen_keys"] = list(seen)
+    print(f"DEBUG posted={posted}")
 
 
 async def main():
