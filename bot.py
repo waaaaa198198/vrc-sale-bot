@@ -61,8 +61,46 @@ NEGATIVE_WORDS = [
     "u#don", "udon", "udonsharp", "pickup", "pick up",
     "interact", "ギミック", "オブジェクト", "cluster",
 
-    # その他対象外になりやすいもの
+    # その他対象外
     "live2d", "aviutl", "after effects", "動画素材",
+]
+
+EXCLUDED_TAGS = [
+    # 二次創作グッズ系
+    "二次創作",
+    "ファンアート",
+    "fanart",
+    "グッズ",
+    "アクリル",
+    "アクリルキーホルダー",
+    "缶バッジ",
+    "ステッカー",
+    "ポスター",
+    "タペストリー",
+    "ぬいぐるみ",
+    "抱き枕",
+    "抱き枕カバー",
+    "クリアファイル",
+
+    # ワールド系
+    "ワールド",
+    "ワールド用",
+    "ワールド向け",
+    "ワールド専用",
+    "Udon",
+    "UdonSharp",
+    "ギミック",
+    "オブジェクト",
+    "cluster",
+
+    # 素材系
+    "素材",
+    "テクスチャ",
+    "shader",
+    "matcap",
+    "BGM",
+    "効果音",
+    "音声",
 ]
 
 CATEGORY_KEYWORDS = {
@@ -84,6 +122,21 @@ CATEGORY_KEYWORDS = {
     "ポーズ": [
         "ポーズ", "pose", "撮影ポーズ", "立ちポーズ",
         "座りポーズ", "ポージング"
+    ],
+}
+
+CATEGORY_TAG_MAP = {
+    "衣装": [
+        "衣装", "服", "outfit", "costume"
+    ],
+    "髪型": [
+        "髪型", "髪", "ヘア", "hair", "hairstyle"
+    ],
+    "アクセサリー": [
+        "アクセサリー", "アクセ", "装飾", "小物", "accessory"
+    ],
+    "ポーズ": [
+        "ポーズ", "pose", "撮影ポーズ", "ポージング"
     ],
 }
 
@@ -296,6 +349,50 @@ def detect_categories(text: str) -> list[str]:
     return found
 
 
+def extract_tags_from_page(soup: BeautifulSoup) -> list[str]:
+    tags = []
+
+    selectors = [
+        'a[href*="/tags/"]',
+        'a[href*="/tag/"]',
+        '[class*="tag"] a',
+        '[class*="Tag"] a',
+    ]
+
+    for selector in selectors:
+        for tag in soup.select(selector):
+            t = tag.get_text(" ", strip=True)
+            t = re.sub(r"\s+", " ", t).strip()
+            if t:
+                tags.append(t)
+
+    dedup = []
+    seen = set()
+    for t in tags:
+        key = t.lower()
+        if key not in seen:
+            dedup.append(t)
+            seen.add(key)
+
+    return dedup
+
+
+def should_exclude_by_tags(tags: list[str]) -> bool:
+    lower_tags = [t.lower() for t in tags]
+    return any(ex.lower() in lower_tags for ex in EXCLUDED_TAGS)
+
+
+def detect_categories_from_tags(tags: list[str]) -> list[str]:
+    lower_tags = [t.lower() for t in tags]
+    found = []
+
+    for category, keywords in CATEGORY_TAG_MAP.items():
+        if any(word.lower() in lower_tags for word in keywords):
+            found.append(category)
+
+    return found
+
+
 def looks_target_item(text: str, categories: list[str]) -> bool:
     lower = text.lower()
     if any(word.lower() in lower for word in COMMON_POSITIVE_WORDS):
@@ -456,6 +553,7 @@ async def get_product_page_info(session: aiohttp.ClientSession, url: str) -> dic
             "price": None,
             "discount_percent": 0,
             "is_sale_hint": False,
+            "tags": [],
         }
 
     try:
@@ -481,6 +579,7 @@ async def get_product_page_info(session: aiohttp.ClientSession, url: str) -> dic
         price = parse_price(body_text)
         discount_percent = parse_discount_percent(body_text)
         is_sale_hint = looks_sale_text(body_text)
+        tags = extract_tags_from_page(soup)
 
         return {
             "title": title[:256] if title else None,
@@ -489,6 +588,7 @@ async def get_product_page_info(session: aiohttp.ClientSession, url: str) -> dic
             "price": price,
             "discount_percent": discount_percent,
             "is_sale_hint": is_sale_hint,
+            "tags": tags,
         }
     except Exception as e:
         print(f"get_product_page_info parse error {url}: {e}")
@@ -499,6 +599,7 @@ async def get_product_page_info(session: aiohttp.ClientSession, url: str) -> dic
             "price": None,
             "discount_percent": 0,
             "is_sale_hint": False,
+            "tags": [],
         }
 
 
@@ -508,12 +609,26 @@ async def enrich_and_filter_item(session: aiohttp.ClientSession, item: dict) -> 
         return None
 
     page_info = await get_product_page_info(session, url)
+    tags = page_info.get("tags", [])
+
     merged_text = " ".join([
         item.get("title", ""),
         item.get("text", ""),
         page_info.get("title") or "",
         page_info.get("text") or "",
+        " ".join(tags),
     ]).strip()
+
+    exclude_text = " ".join([
+        item.get("title", ""),
+        item.get("text", ""),
+        page_info.get("title") or "",
+        " ".join(tags),
+    ]).strip()
+
+    if should_exclude_by_tags(tags):
+        print(f"FILTER exclude_tags: {normalize_booth_url(url)} tags={tags}")
+        return None
 
     strong_exclude_patterns = [
         r"ワールド(専用|向け|用)",
@@ -527,15 +642,22 @@ async def enrich_and_filter_item(session: aiohttp.ClientSession, item: dict) -> 
         r"ぬいぐるみ",
     ]
     for pattern in strong_exclude_patterns:
-        if re.search(pattern, merged_text, re.IGNORECASE):
+        if re.search(pattern, exclude_text, re.IGNORECASE):
             print(f"FILTER strong_exclude: {normalize_booth_url(url)}")
             return None
 
-    if should_exclude(merged_text):
+    if should_exclude(exclude_text):
         print(f"FILTER negative_words: {normalize_booth_url(url)}")
         return None
 
-    categories = detect_categories(merged_text)
+    categories_text = detect_categories(merged_text)
+    categories_tags = detect_categories_from_tags(tags)
+
+    categories = []
+    for c in categories_text + categories_tags:
+        if c not in categories:
+            categories.append(c)
+
     if not categories:
         categories = ["未分類"]
 
@@ -595,6 +717,7 @@ async def enrich_and_filter_item(session: aiohttp.ClientSession, item: dict) -> 
             "title": (page_info.get("title") or item.get("title") or "")[:60],
             "price": price,
             "categories": categories,
+            "tags": tags[:10],
             "discount_percent": discount_percent,
             "is_sale": is_sale,
             "route": route,
@@ -615,6 +738,7 @@ async def enrich_and_filter_item(session: aiohttp.ClientSession, item: dict) -> 
         "discount_percent": discount_percent,
         "is_sale": is_sale,
         "route": route,
+        "tags": tags,
     }
 
 
@@ -649,6 +773,9 @@ def build_embed(item: dict) -> dict:
     if item.get("limited_free") and item.get("price") == 0:
         limited_flag = "⏳ 期間限定無料の可能性あり\n"
 
+    tags = item.get("tags", [])
+    tags_preview = ", ".join(tags[:8]) if tags else "なし"
+
     if item.get("route") == "free":
         description = f"{limited_flag}{sale_line}🆓 無料アイテム\n📂 {category_text}"
         color = 0x00CC99
@@ -664,6 +791,7 @@ def build_embed(item: dict) -> dict:
         "fields": [
             {"name": "BOOTH", "value": item["url"], "inline": False},
             {"name": "検出元", "value": source_line[:1024], "inline": False},
+            {"name": "タグ", "value": tags_preview[:1024], "inline": False},
         ],
         "footer": {"text": "BOOTH / vrc-sale monitor"},
     }
@@ -872,6 +1000,7 @@ async def process_candidates(session: aiohttp.ClientSession, state: dict):
                     "route": enriched["route"],
                     "discount_percent": enriched["discount_percent"],
                     "is_sale": enriched["is_sale"],
+                    "tags": enriched.get("tags", [])[:5],
                     "url": enriched["url"],
                 }
             )
